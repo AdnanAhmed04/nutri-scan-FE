@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -21,12 +21,15 @@ const MEAL_SECTIONS = [
   { key: 'snack', title: 'Snacks & Extras', icon: 'cafe', color: '#ec4899', sub: 'Recommended ~300 kcal' },
 ];
 
-export default function DietScreen({ navigation }) {
-  const { user } = useAuth();
+export default function DietScreen({ navigation, route }) {
+  const { user, refreshUser } = useAuth();
   const [dietData, setDietData] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
   const [selectedMealType, setSelectedMealType] = useState('breakfast');
+  const scrollViewRef = useRef(null);
+
+  const isReloadingRef = useRef(false);
 
   const fetchDiet = useCallback(async () => {
     try {
@@ -37,16 +40,45 @@ export default function DietScreen({ navigation }) {
     }
   }, []);
 
+  const handleReload = useCallback(async () => {
+    if (isReloadingRef.current) return;
+    try {
+      isReloadingRef.current = true;
+      setRefreshing(true);
+      scrollViewRef.current?.scrollTo({ y: 0, animated: true });
+      const [data] = await Promise.all([
+        api.getTodayDiet(),
+        refreshUser ? refreshUser() : Promise.resolve(),
+      ]);
+      if (data) {
+        setDietData(data);
+      }
+    } catch (e) {
+      console.log('DietScreen reload error:', e.message);
+    } finally {
+      setRefreshing(false);
+      isReloadingRef.current = false;
+    }
+  }, [refreshUser]);
+
   useEffect(() => {
     fetchDiet();
-    const unsubscribe = navigation.addListener('focus', fetchDiet);
-    return unsubscribe;
+    const unsubscribeFocus = navigation.addListener('focus', fetchDiet);
+    return unsubscribeFocus;
   }, [navigation, fetchDiet]);
 
+  // Reload when user clicks Diet while already on Diet
+  useEffect(() => {
+    const unsubscribeTabPress = navigation.addListener('tabPress', () => {
+      if (navigation.isFocused()) {
+        handleReload();
+      }
+    });
+    return unsubscribeTabPress;
+  }, [navigation, handleReload]);
+
   const onRefresh = async () => {
-    setRefreshing(true);
-    await fetchDiet();
-    setRefreshing(false);
+    await handleReload();
   };
 
   const handleOpenAddMeal = (mealType) => {
@@ -104,10 +136,16 @@ export default function DietScreen({ navigation }) {
       />
 
       <ScrollView
+        ref={scrollViewRef}
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={tw`p-5 pb-28`}
+        contentContainerStyle={tw`p-5 pb-36`}
         refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#10b981" />
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleReload}
+            tintColor="#10b981"
+            colors={['#10b981']}
+          />
         }
       >
         {/* Macro & Calorie Header Card */}
@@ -312,7 +350,7 @@ export default function DietScreen({ navigation }) {
       {/* Floating Add Meal Button */}
       <TouchableOpacity
         onPress={() => handleOpenAddMeal('breakfast')}
-        style={tw`absolute bottom-6 right-6 flex-row items-center bg-emerald-500 px-5 py-3.5 rounded-full shadow-2xl elevation-8`}
+        style={tw`absolute bottom-24 right-5 flex-row items-center bg-emerald-500 px-5 py-3.5 rounded-full shadow-2xl elevation-10 border border-emerald-400`}
       >
         <Ionicons name="add" size={22} color="#ffffff" />
         <Text style={tw`text-white font-bold text-sm ml-1.5`}>Log Meal</Text>

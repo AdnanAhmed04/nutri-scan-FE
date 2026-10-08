@@ -73,6 +73,14 @@ const mockProfile = {
   dietType: 'Balanced',
   activityLevel: 'Moderate',
   streakDays: 7,
+  allergies: ['Peanuts', 'Lactose'],
+  likedFoods: ['Grilled Salmon', 'Avocado', 'Greek Yogurt', 'Berries'],
+  notifications: {
+    nextMeal: true,
+    hydration: true,
+    dailySummary: true,
+    streakReminder: true,
+  },
 };
 
 let localMeals = [

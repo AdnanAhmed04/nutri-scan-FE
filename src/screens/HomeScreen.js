@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -7,19 +7,24 @@ import {
   RefreshControl,
   Alert,
 } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
+import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import tw from '../theme/tailwind';
 import Header from '../components/Header';
 import StatCard from '../components/StatCard';
 import MealModal from '../components/MealModal';
+import TutorChatModal from '../components/TutorChatModal';
 import api from '../services/api';
 import { useAuth } from '../context/AuthContext';
 
-export default function HomeScreen({ navigation }) {
-  const { user } = useAuth();
+export default function HomeScreen({ navigation, route }) {
+  const { user, refreshUser } = useAuth();
   const [dietData, setDietData] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
+  const [chatModalVisible, setChatModalVisible] = useState(false);
+  const scrollViewRef = useRef(null);
+
+  const isReloadingRef = useRef(false);
 
   const fetchDiet = useCallback(async () => {
     try {
@@ -30,16 +35,45 @@ export default function HomeScreen({ navigation }) {
     }
   }, []);
 
+  const handleReload = useCallback(async () => {
+    if (isReloadingRef.current) return;
+    try {
+      isReloadingRef.current = true;
+      setRefreshing(true);
+      scrollViewRef.current?.scrollTo({ y: 0, animated: true });
+      const [data] = await Promise.all([
+        api.getTodayDiet(),
+        refreshUser ? refreshUser() : Promise.resolve(),
+      ]);
+      if (data) {
+        setDietData(data);
+      }
+    } catch (e) {
+      console.log('HomeScreen reload error:', e.message);
+    } finally {
+      setRefreshing(false);
+      isReloadingRef.current = false;
+    }
+  }, [refreshUser]);
+
   useEffect(() => {
     fetchDiet();
-    const unsubscribe = navigation.addListener('focus', fetchDiet);
-    return unsubscribe;
+    const unsubscribeFocus = navigation.addListener('focus', fetchDiet);
+    return unsubscribeFocus;
   }, [navigation, fetchDiet]);
 
+  // Reload when user clicks Home while already on Home
+  useEffect(() => {
+    const unsubscribeTabPress = navigation.addListener('tabPress', () => {
+      if (navigation.isFocused()) {
+        handleReload();
+      }
+    });
+    return unsubscribeTabPress;
+  }, [navigation, handleReload]);
+
   const onRefresh = async () => {
-    setRefreshing(true);
-    await fetchDiet();
-    setRefreshing(false);
+    await handleReload();
   };
 
   const handleQuickWater = async () => {
@@ -70,15 +104,20 @@ export default function HomeScreen({ navigation }) {
     <View style={tw`flex-1 bg-slate-950`}>
       <Header
         title={`Hi, ${user?.name ? user.name.split(' ')[0] : 'Alex'} 👋`}
-        subtitle="Daily Overview"
         onAvatarPress={() => navigation.navigate('Profile')}
       />
 
       <ScrollView
+        ref={scrollViewRef}
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={tw`p-5 pb-24`}
+        contentContainerStyle={tw`p-5 pb-36`}
         refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#10b981" />
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleReload}
+            tintColor="#10b981"
+            colors={['#10b981']}
+          />
         }
       >
         {/* Sync Status Badge */}
@@ -215,20 +254,15 @@ export default function HomeScreen({ navigation }) {
           </TouchableOpacity>
 
           <TouchableOpacity
-            onPress={() =>
-              Alert.alert(
-                '🤖 AI Chatbot Preview',
-                'Your AI Diet & Study Coach is being wired up with LLM support! Soon you can ask questions like "What should I eat after my workout?" or "Explain this concept".'
-              )
-            }
+            onPress={() => navigation.navigate('GenerateMeal')}
             style={tw`flex-1 min-w-[45%] bg-slate-900 border border-slate-800 p-4 rounded-2xl flex-row items-center`}
           >
             <View style={tw`w-10 h-10 rounded-xl bg-amber-500/20 items-center justify-center mr-3`}>
-              <Ionicons name="chatbubbles" size={22} color="#fbbf24" />
+              <Ionicons name="sparkles" size={20} color="#fbbf24" />
             </View>
             <View>
-              <Text style={tw`text-white font-bold text-sm`}>Ask Tutor</Text>
-              <Text style={tw`text-amber-400 text-[11px] font-medium`}>AI Preview</Text>
+              <Text style={tw`text-white font-bold text-sm`}>Generate Meal</Text>
+              <Text style={tw`text-amber-400 text-[11px] font-medium`}>AI Recipes</Text>
             </View>
           </TouchableOpacity>
         </View>
@@ -309,6 +343,35 @@ export default function HomeScreen({ navigation }) {
         visible={modalVisible}
         onClose={() => setModalVisible(false)}
         onAddMeal={handleAddMeal}
+      />
+
+      {/* Floating AI Healthcare Chatbot FAB at bottom-right corner */}
+      <TouchableOpacity
+        onPress={() => setChatModalVisible(true)}
+        activeOpacity={0.85}
+        style={[
+          tw`absolute bottom-24 right-5 w-14 h-14 rounded-full bg-emerald-500 items-center justify-center border-2 border-emerald-300 shadow-2xl`,
+          {
+            elevation: 12,
+            shadowColor: '#10b981',
+            shadowOffset: { width: 0, height: 6 },
+            shadowOpacity: 0.5,
+            shadowRadius: 10,
+          },
+        ]}
+      >
+        <MaterialCommunityIcons name="robot" size={26} color="#ffffff" />
+        <View style={tw`absolute -top-1.5 -right-1.5 bg-rose-500 w-5 h-5 rounded-full items-center justify-center border-2 border-slate-950 shadow`}>
+          <Ionicons name="pulse" size={11} color="#ffffff" />
+        </View>
+      </TouchableOpacity>
+
+      {/* Tutor Chatbot Modal */}
+      <TutorChatModal
+        visible={chatModalVisible}
+        onClose={() => setChatModalVisible(false)}
+        dietData={dietData}
+        userProfile={user}
       />
     </View>
   );
