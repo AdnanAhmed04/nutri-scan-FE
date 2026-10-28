@@ -15,9 +15,12 @@ import MealModal from '../components/MealModal';
 import TutorChatModal from '../components/TutorChatModal';
 import api from '../services/api';
 import { useAuth } from '../context/AuthContext';
+import useDietSync from '../hooks/useDietSync';
+import { showMessage } from '../utils/dialogs';
 
 export default function HomeScreen({ navigation, route }) {
   const { user, refreshUser } = useAuth();
+  const onDietLoaded = useDietSync();
   const [dietData, setDietData] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
@@ -25,6 +28,11 @@ export default function HomeScreen({ navigation, route }) {
   const scrollViewRef = useRef(null);
 
   const isReloadingRef = useRef(false);
+
+  // Keep streak + reminders in sync with the latest data
+  useEffect(() => {
+    onDietLoaded(dietData);
+  }, [dietData, onDietLoaded]);
 
   const fetchDiet = useCallback(async () => {
     try {
@@ -80,7 +88,13 @@ export default function HomeScreen({ navigation, route }) {
     try {
       const newCount = await api.updateWater(1);
       setDietData((prev) => (prev ? { ...prev, waterGlassesToday: newCount } : prev));
-      Alert.alert('💧 Water Tracked!', `Logged 1 glass. Total today: ${newCount} / 8 glasses.`);
+      const goal = dietData?.waterGoalGlasses || 8;
+      showMessage(
+        '💧 Water Tracked',
+        newCount >= goal
+          ? `${newCount} / ${goal} glasses. You reached today's goal!`
+          : `Logged 1 glass. Total today: ${newCount} / ${goal} glasses.`
+      );
     } catch (e) {
       console.log('Error updating water:', e.message);
     }
@@ -103,7 +117,7 @@ export default function HomeScreen({ navigation, route }) {
   return (
     <View style={tw`flex-1 bg-slate-950`}>
       <Header
-        title={`Hi, ${user?.name ? user.name.split(' ')[0] : 'Alex'} 👋`}
+        title={`Hi${user?.name ? `, ${user.name.split(' ')[0]}` : ''} 👋`}
         onAvatarPress={() => navigation.navigate('Profile')}
       />
 
@@ -230,7 +244,7 @@ export default function HomeScreen({ navigation, route }) {
             <View>
               <Text style={tw`text-white font-bold text-sm`}>+1 Water</Text>
               <Text style={tw`text-slate-400 text-[11px]`}>
-                {dietData?.waterGlassesToday || 5}/8 glasses
+                {dietData?.waterGlassesToday ?? 0}/{dietData?.waterGoalGlasses || 8} glasses
               </Text>
             </View>
           </TouchableOpacity>

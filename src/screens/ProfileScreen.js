@@ -13,11 +13,18 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
+import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
+import Avatar from '../components/Avatar';
+import api, { resolveAvatarUrl } from '../services/api';
+import { ensurePermission, syncReminders, todayFromDiet } from '../services/reminders';
 import tw from '../theme/tailwind';
 import Header from '../components/Header';
 import ChangePasswordModal from '../components/ChangePasswordModal';
 import { confirmAction, showMessage } from '../utils/dialogs';
 import { useAuth } from '../context/AuthContext';
+
+// Profile photos are resized to this width before upload
+const AVATAR_SIZE = 256;
 
 const DIET_TYPES = ['Balanced', 'High Protein', 'Keto', 'Vegan', 'Vegetarian', 'Low Carb'];
 
@@ -43,7 +50,7 @@ const DEFAULT_LIKED_FOODS = [
 ];
 
 export default function ProfileScreen({ navigation, route }) {
-  const { user, updateUser, logout, logoutAllDevices, refreshUser } = useAuth();
+  const { user, updateUser, logout, logoutAllDevices, refreshUser, uploadAvatar, removeAvatar } = useAuth();
   const scrollViewRef = useRef(null);
   const [refreshing, setRefreshing] = useState(false);
   const [passwordModalVisible, setPasswordModalVisible] = useState(false);
@@ -88,12 +95,13 @@ export default function ProfileScreen({ navigation, route }) {
     }
   };
 
-  // Profile Basic State
-  const [avatar, setAvatar] = useState(
-    user?.avatar ||
-      'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400&auto=format&fit=crop&q=80'
-  );
-  const [name, setName] = useState(user?.name || 'Alex Johnson');
+  // Profile photo: local preview while the upload is running
+  const [avatarPreview, setAvatarPreview] = useState(null);
+  const [avatarBusy, setAvatarBusy] = useState(false);
+  // 'granted' | 'denied' | 'unsupported' | null (unknown yet)
+  const [notifPermission, setNotifPermission] = useState(null);
+
+  const [name, setName] = useState(user?.name || '');
   const [isEditingMetrics, setIsEditingMetrics] = useState(false);
   const [weight, setWeight] = useState(String(user?.weightKg || 72));
   const [height, setHeight] = useState(String(user?.heightCm || 178));
@@ -138,7 +146,6 @@ export default function ProfileScreen({ navigation, route }) {
 
   const syncWithUser = useCallback((userData) => {
     if (!userData) return;
-    if (userData.avatar) setAvatar(userData.avatar);
     if (userData.name) setName(userData.name);
     if (userData.weightKg !== undefined) setWeight(String(userData.weightKg));
     if (userData.heightCm !== undefined) setHeight(String(userData.heightCm));
@@ -322,15 +329,13 @@ export default function ProfileScreen({ navigation, route }) {
     setIsEditingMetrics(false);
   };
 
-  // Handle Profile Photo Upload via Expo Image Picker
+  // Pick a photo, shrink it to 256px JPEG on the device (~20-40 KB), then upload it
   const handleUploadAvatar = async () => {
+    if (avatarBusy) return;
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== 'granted') {
-        Alert.alert(
-          'Permission Required',
-          'Please allow access to your photo library to upload a profile picture.'
-        );
+        showMessage('Permission Required', 'Please allow photo library access to choose a profile picture.');
         return;
       }
 
@@ -338,18 +343,46 @@ export default function ProfileScreen({ navigation, route }) {
         mediaTypes: ['images'],
         allowsEditing: true,
         aspect: [1, 1],
-        quality: 0.8,
+        quality: 1,
       });
+      if (result.canceled || !result.assets?.length) return;
 
-      if (!result.canceled && result.assets && result.assets.length > 0) {
-        const imageUri = result.assets[0].uri;
-        setAvatar(imageUri);
-        await updateUser({ avatar: imageUri });
-        Alert.alert('Profile Photo Updated', 'Your new profile image has been saved!');
-      }
+      setAvatarBusy(true);
+      setAvatarPreview(result.assets[0].uri);
+
+      // maxWidth downsamples while decoding so large camera photos don't use lots of memory
+      const context = ImageManipulator.manipulate(result.assets[0].uri, { maxWidth: 1024 });
+      context.resize({ width: AVATAR_SIZE });
+      const rendered = await context.renderAsync();
+      const saved = await rendered.saveAsync({ format: SaveFormat.JPEG, compress: 0.8, base64: true });
+
+      await uploadAvatar(saved.base64);
+      showMessage('Profile Photo Updated', 'Your new profile photo has been saved.');
     } catch (e) {
-      console.log('Error selecting image:', e);
-      Alert.alert('Error', 'Could not open image picker.');
+      console.log('Avatar upload error:', e.message);
+      showMessage('Upload Failed', e.message || 'Could not update your profile photo.');
+    } finally {
+      setAvatarPreview(null);
+      setAvatarBusy(false);
+    }
+  };
+
+  const handleRemoveAvatar = async () => {
+    if (avatarBusy) return;
+    const confirmed = await confirmAction({
+      title: 'Remove Photo',
+      message: 'Remove your profile photo?',
+      confirmText: 'Remove',
+      destructive: true,
+    });
+    if (!confirmed) return;
+    setAvatarBusy(true);
+    try {
+      await removeAvatar();
+    } catch (e) {
+      showMessage('Error', e.message || 'Could not remove photo.');
+    } finally {
+      setAvatarBusy(false);
     }
   };
 
@@ -443,7 +476,27 @@ export default function ProfileScreen({ navigation, route }) {
       streakReminder: key === 'streakReminder' ? value : streakNotif,
     };
     await updateUser({ notifications: updatedNotifs });
+
+    if (value) {
+      const permission = await ensurePermission({ ask: true });
+      setNotifPermission(permission);
+      if (permission === 'denied') {
+        showMessage(
+          'Notifications Blocked',
+          'Reminders are turned on, but notifications are blocked for this app. Enable them in your phone Settings.'
+        );
+      }
+    }
+
+    // Rebuild reminders using today's progress so already-done reminders are skipped
+    const diet = await api.getTodayDiet();
+    syncReminders(updatedNotifs, todayFromDiet(diet), { askPermission: false });
   };
+
+  // Check notification permission once (without prompting) to show a warning if blocked
+  useEffect(() => {
+    ensurePermission({ ask: false }).then(setNotifPermission).catch(() => {});
+  }, []);
 
   const activeNotifsCount =
     (nextMealNotif ? 1 : 0) +
@@ -472,24 +525,39 @@ export default function ProfileScreen({ navigation, route }) {
         <View style={tw`bg-slate-900 border border-slate-800 rounded-3xl p-5 mb-5 items-center shadow-xl`}>
           <TouchableOpacity
             onPress={handleUploadAvatar}
+            disabled={avatarBusy}
             activeOpacity={0.8}
+            accessibilityRole="button"
+            accessibilityLabel="Change profile photo"
             style={tw`relative mb-3`}
           >
-            <Image
-              source={{ uri: avatar }}
-              style={tw`w-24 h-24 rounded-full border-4 border-emerald-500`}
-            />
+            <Avatar user={user} uri={avatarPreview} size={96} borderWidth={4} />
+            {avatarBusy ? (
+              <View style={tw`absolute inset-0 rounded-full bg-black/50 items-center justify-center`}>
+                <ActivityIndicator color="#ffffff" />
+              </View>
+            ) : null}
             {/* Camera Upload Badge */}
             <View style={tw`absolute bottom-0 right-0 bg-emerald-500 w-8 h-8 rounded-full items-center justify-center border-2 border-slate-900 shadow-md`}>
               <Ionicons name="camera" size={15} color="#ffffff" />
             </View>
           </TouchableOpacity>
 
-          <TouchableOpacity onPress={handleUploadAvatar} style={tw`mb-2`}>
-            <Text style={tw`text-emerald-400 text-xs font-semibold`}>
-              Tap to change profile picture
-            </Text>
-          </TouchableOpacity>
+          <View style={tw`flex-row items-center mb-2`}>
+            <TouchableOpacity onPress={handleUploadAvatar} disabled={avatarBusy} accessibilityRole="button">
+              <Text style={tw`text-emerald-400 text-xs font-semibold`}>
+                {avatarBusy ? 'Saving photo...' : resolveAvatarUrl(user?.avatar) ? 'Change photo' : 'Add a profile photo'}
+              </Text>
+            </TouchableOpacity>
+            {resolveAvatarUrl(user?.avatar) && !avatarBusy ? (
+              <>
+                <Text style={tw`text-slate-600 text-xs mx-2`}>•</Text>
+                <TouchableOpacity onPress={handleRemoveAvatar} accessibilityRole="button">
+                  <Text style={tw`text-rose-400 text-xs font-semibold`}>Remove</Text>
+                </TouchableOpacity>
+              </>
+            ) : null}
+          </View>
 
           <Text style={tw`text-white text-xl font-bold`}>{user?.name || name}</Text>
           <Text style={tw`text-slate-400 text-xs mt-0.5`}>
@@ -505,7 +573,7 @@ export default function ProfileScreen({ navigation, route }) {
             <View style={tw`bg-amber-500/10 px-3 py-1 rounded-full border border-amber-500/30 flex-row items-center`}>
               <Ionicons name="flame" size={13} color="#f59e0b" />
               <Text style={tw`text-amber-400 text-xs font-semibold ml-1`}>
-                {user?.streakDays || 7} Days Streak
+                {user?.streakDays ?? 0} Day{(user?.streakDays ?? 0) === 1 ? '' : 's'} Streak
               </Text>
             </View>
           </View>
@@ -1249,12 +1317,22 @@ export default function ProfileScreen({ navigation, route }) {
           {/* Collapsible Content */}
           {openNotifications && (
             <View style={tw`mt-4 pt-2 border-t border-slate-800`}>
-              {/* Toggle 1: Next Meal Notification */}
+              {notifPermission === 'unsupported' ? (
+                <Text style={tw`text-amber-300 text-[11px] py-2`}>
+                  Reminders work in the Android and iOS app. Your choices are saved for when you use the app on a phone.
+                </Text>
+              ) : notifPermission === 'denied' && activeNotifsCount > 0 ? (
+                <Text style={tw`text-amber-300 text-[11px] py-2`}>
+                  Notifications are blocked for this app. Enable them in your phone Settings to get reminders.
+                </Text>
+              ) : null}
+
+              {/* Toggle 1: Upcoming meal reminders */}
               <View style={tw`flex-row justify-between items-center py-3 border-b border-slate-800/80`}>
                 <View style={tw`flex-1 pr-3`}>
-                  <Text style={tw`text-white text-xs font-bold`}>Next Meal Notification</Text>
+                  <Text style={tw`text-white text-xs font-bold`}>Upcoming Meal Reminders</Text>
                   <Text style={tw`text-slate-400 text-[11px]`}>
-                    Scheduled alerts for Breakfast, Lunch & Dinner
+                    Breakfast 8:30 AM, Lunch 1:00 PM, Dinner 7:30 PM. Skipped if that meal is already logged.
                   </Text>
                 </View>
                 <Switch
@@ -1270,9 +1348,9 @@ export default function ProfileScreen({ navigation, route }) {
               {/* Toggle 2: Hydration & Water Notification */}
               <View style={tw`flex-row justify-between items-center py-3 border-b border-slate-800/80`}>
                 <View style={tw`flex-1 pr-3`}>
-                  <Text style={tw`text-white text-xs font-bold`}>Hydration Notification</Text>
+                  <Text style={tw`text-white text-xs font-bold`}>Drink Water Reminders</Text>
                   <Text style={tw`text-slate-400 text-[11px]`}>
-                    Hourly prompts to drink a glass of water (8 glasses daily)
+                    Every 2 hours from 10 AM to 8 PM, until you reach your {user?.waterGoalGlasses || 8}-glass goal
                   </Text>
                 </View>
                 <Switch
@@ -1288,9 +1366,9 @@ export default function ProfileScreen({ navigation, route }) {
               {/* Toggle 3: Daily Summary Notification */}
               <View style={tw`flex-row justify-between items-center py-3 border-b border-slate-800/80`}>
                 <View style={tw`flex-1 pr-3`}>
-                  <Text style={tw`text-white text-xs font-bold`}>Daily Progress Summary</Text>
+                  <Text style={tw`text-white text-xs font-bold`}>Log Meals Reminder</Text>
                   <Text style={tw`text-slate-400 text-[11px]`}>
-                    Evening report of calories, macros & streak
+                    9 PM nudge to log today's food if fewer than 3 meals are logged
                   </Text>
                 </View>
                 <Switch
@@ -1306,9 +1384,9 @@ export default function ProfileScreen({ navigation, route }) {
               {/* Toggle 4: Health Streak & Motivation */}
               <View style={tw`flex-row justify-between items-center py-3`}>
                 <View style={tw`flex-1 pr-3`}>
-                  <Text style={tw`text-white text-xs font-bold`}>Streak & Habit Alerts</Text>
+                  <Text style={tw`text-white text-xs font-bold`}>Streak Reminder</Text>
                   <Text style={tw`text-slate-400 text-[11px]`}>
-                    Gentle reminders to maintain your 7-day consistency
+                    8 PM reminder if you haven't logged anything yet today
                   </Text>
                 </View>
                 <Switch

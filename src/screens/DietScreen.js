@@ -13,6 +13,14 @@ import Header from '../components/Header';
 import MealModal from '../components/MealModal';
 import api from '../services/api';
 import { useAuth } from '../context/AuthContext';
+import useDietSync from '../hooks/useDietSync';
+
+const GLASS_ML = 250;
+const MAX_WATER = 30; // matches the server limit
+
+// "2026-10-10" -> "Sa" (weekday of that calendar date)
+const weekdayShort = (dateStr) =>
+  new Date(`${dateStr}T12:00:00Z`).toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }).slice(0, 2);
 
 const MEAL_SECTIONS = [
   { key: 'breakfast', title: 'Breakfast', icon: 'sunny', color: '#f59e0b', sub: 'Recommended ~500 kcal' },
@@ -23,7 +31,9 @@ const MEAL_SECTIONS = [
 
 export default function DietScreen({ navigation, route }) {
   const { user, refreshUser } = useAuth();
+  const onDietLoaded = useDietSync();
   const [dietData, setDietData] = useState(null);
+  const [history, setHistory] = useState(null); // last 7 days, oldest first
   const [refreshing, setRefreshing] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
   const [selectedMealType, setSelectedMealType] = useState('breakfast');
@@ -31,14 +41,23 @@ export default function DietScreen({ navigation, route }) {
 
   const isReloadingRef = useRef(false);
 
+  useEffect(() => {
+    onDietLoaded(dietData);
+  }, [dietData, onDietLoaded]);
+
+  const fetchHistory = useCallback(async () => {
+    const data = await api.getHistory(7);
+    if (data) setHistory(data.days);
+  }, []);
+
   const fetchDiet = useCallback(async () => {
     try {
-      const data = await api.getTodayDiet();
+      const [data] = await Promise.all([api.getTodayDiet(), fetchHistory()]);
       setDietData(data);
     } catch (e) {
       console.log('DietScreen fetch error:', e.message);
     }
-  }, []);
+  }, [fetchHistory]);
 
   const handleReload = useCallback(async () => {
     if (isReloadingRef.current) return;
@@ -49,6 +68,7 @@ export default function DietScreen({ navigation, route }) {
       const [data] = await Promise.all([
         api.getTodayDiet(),
         refreshUser ? refreshUser() : Promise.resolve(),
+        fetchHistory(),
       ]);
       if (data) {
         setDietData(data);
@@ -59,7 +79,7 @@ export default function DietScreen({ navigation, route }) {
       setRefreshing(false);
       isReloadingRef.current = false;
     }
-  }, [refreshUser]);
+  }, [refreshUser, fetchHistory]);
 
   useEffect(() => {
     fetchDiet();
@@ -109,6 +129,10 @@ export default function DietScreen({ navigation, route }) {
     try {
       const newCount = await api.updateWater(delta);
       setDietData((prev) => (prev ? { ...prev, waterGlassesToday: newCount } : prev));
+      // Keep today's bar in the 7-day history in step
+      setHistory((prev) =>
+        prev ? prev.map((d, i) => (i === prev.length - 1 ? { ...d, waterGlasses: newCount } : d)) : prev
+      );
     } catch (e) {
       console.log('Water update error:', e.message);
     }
@@ -126,6 +150,9 @@ export default function DietScreen({ navigation, route }) {
     snack: [],
   };
   const waterCount = dietData?.waterGlassesToday || 0;
+  const waterGoal = dietData?.waterGoalGlasses || user?.waterGoalGlasses || 8;
+  const waterLitres = ((waterGoal * GLASS_ML) / 1000).toFixed(1);
+  const historyMax = Math.max(waterGoal, ...(history || []).map((d) => d.waterGlasses));
 
   return (
     <View style={tw`flex-1 bg-slate-950`}>
@@ -210,7 +237,10 @@ export default function DietScreen({ navigation, route }) {
               </View>
               <View>
                 <Text style={tw`text-white font-bold text-sm`}>Hydration Tracker</Text>
-                <Text style={tw`text-slate-400 text-xs`}>{waterCount} of 8 glasses (2.0L)</Text>
+                <Text style={tw`text-slate-400 text-xs`}>
+                  {waterCount} of {waterGoal} glasses ({waterLitres}L)
+                  {waterCount >= waterGoal ? ' • Goal reached 🎉' : ''}
+                </Text>
               </View>
             </View>
 
@@ -218,6 +248,8 @@ export default function DietScreen({ navigation, route }) {
               <TouchableOpacity
                 onPress={() => handleWaterChange(-1)}
                 disabled={waterCount <= 0}
+                accessibilityRole="button"
+                accessibilityLabel="Remove one glass of water"
                 style={tw`w-8 h-8 rounded-full bg-slate-800 border border-slate-700 items-center justify-center ${
                   waterCount <= 0 ? 'opacity-40' : ''
                 }`}
@@ -227,35 +259,75 @@ export default function DietScreen({ navigation, route }) {
 
               <TouchableOpacity
                 onPress={() => handleWaterChange(1)}
-                style={tw`w-8 h-8 rounded-full bg-sky-500 items-center justify-center`}
+                disabled={waterCount >= MAX_WATER}
+                accessibilityRole="button"
+                accessibilityLabel="Add one glass of water"
+                style={tw`w-8 h-8 rounded-full bg-sky-500 items-center justify-center ${
+                  waterCount >= MAX_WATER ? 'opacity-40' : ''
+                }`}
               >
                 <Ionicons name="add" size={16} color="#ffffff" />
               </TouchableOpacity>
             </View>
           </View>
 
-          {/* Water Cups Visual */}
-          <View style={tw`flex-row justify-between pt-1`}>
-            {[1, 2, 3, 4, 5, 6, 7, 8].map((index) => {
-              const isFilled = index <= waterCount;
-              return (
-                <View
-                  key={index}
-                  style={tw`w-7 h-9 rounded-lg items-center justify-center border ${
-                    isFilled
-                      ? 'bg-sky-500/20 border-sky-500'
-                      : 'bg-slate-800/60 border-slate-700/60'
-                  }`}
-                >
-                  <Ionicons
-                    name="water"
-                    size={14}
-                    color={isFilled ? '#38bdf8' : '#475569'}
-                  />
-                </View>
-              );
-            })}
+          {/* Water Cups Visual (one cup per glass in the goal; resets every day) */}
+          <View style={tw`flex-row flex-wrap gap-1.5 pt-1`}>
+            {Array.from({ length: Math.max(waterGoal, Math.min(waterCount, MAX_WATER)) }, (_, i) => i + 1).map(
+              (index) => {
+                const isFilled = index <= waterCount;
+                const isExtra = index > waterGoal;
+                return (
+                  <View
+                    key={index}
+                    style={tw`w-7 h-9 rounded-lg items-center justify-center border ${
+                      isFilled
+                        ? isExtra
+                          ? 'bg-emerald-500/20 border-emerald-500'
+                          : 'bg-sky-500/20 border-sky-500'
+                        : 'bg-slate-800/60 border-slate-700/60'
+                    }`}
+                  >
+                    <Ionicons name="water" size={14} color={isFilled ? (isExtra ? '#34d399' : '#38bdf8') : '#475569'} />
+                  </View>
+                );
+              }
+            )}
           </View>
+
+          {/* Last 7 days */}
+          {history && history.length > 0 ? (
+            <View style={tw`mt-4 pt-3 border-t border-slate-800`}>
+              <Text style={tw`text-slate-400 text-[11px] font-semibold mb-2`}>Last 7 days</Text>
+              <View style={tw`flex-row justify-between items-end h-16`}>
+                {history.map((day, i) => {
+                  const isToday = i === history.length - 1;
+                  const hit = day.waterGlasses >= waterGoal;
+                  const heightPct = historyMax > 0 ? Math.max(6, (day.waterGlasses / historyMax) * 100) : 6;
+                  return (
+                    <View
+                      key={day.date}
+                      style={tw`items-center flex-1`}
+                      accessibilityLabel={`${day.date}: ${day.waterGlasses} glasses`}
+                    >
+                      <Text style={tw`text-slate-500 text-[9px] mb-0.5`}>{day.waterGlasses}</Text>
+                      <View style={tw`w-4 h-10 justify-end`}>
+                        <View
+                          style={[
+                            tw`w-4 rounded-md ${hit ? 'bg-sky-400' : 'bg-sky-500/40'}`,
+                            { height: `${heightPct}%` },
+                          ]}
+                        />
+                      </View>
+                      <Text style={tw`text-[9px] mt-1 ${isToday ? 'text-sky-300 font-bold' : 'text-slate-500'}`}>
+                        {isToday ? 'Today' : weekdayShort(day.date)}
+                      </Text>
+                    </View>
+                  );
+                })}
+              </View>
+            </View>
+          ) : null}
         </View>
 
         {/* Meal Categories Sections */}

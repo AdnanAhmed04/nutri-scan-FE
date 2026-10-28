@@ -27,7 +27,8 @@
     "plugins": [
       "expo-splash-screen",
       "expo-secure-store",
-      "expo-status-bar"
+      "expo-status-bar",
+      ["expo-notifications", { "color": "#10b981" }]
     ]
   }
 }

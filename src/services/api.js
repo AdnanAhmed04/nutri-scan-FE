@@ -36,6 +36,28 @@ const getDefaultBaseUrl = () => {
 };
 
 export const API_BASE_URL = getDefaultBaseUrl();
+const API_ORIGIN = API_BASE_URL.replace(/\/api\/?$/, '');
+
+// Device timezone (e.g. "Asia/Karachi") so the server knows when the user's day starts
+const getDeviceTimezone = () => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * Turns the stored avatar value into an <Image> URI.
+ * Server avatars are relative paths ("/api/user/avatar/..."); anything else that
+ * isn't http(s) (e.g. an old local file path from another device) is ignored.
+ */
+export const resolveAvatarUrl = (avatar) => {
+  if (typeof avatar !== 'string' || !avatar) return null;
+  if (avatar.startsWith('/api/')) return `${API_ORIGIN}${avatar}`;
+  if (/^https?:\/\//i.test(avatar)) return avatar;
+  return null;
+};
 
 const NETWORK_ERROR_MESSAGE =
   "Can't reach the server. Check your internet connection and make sure the server is running.";
@@ -54,6 +76,7 @@ const rawRequest = async (endpoint, { method = 'GET', body, token, timeoutMs = 8
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
+        ...(getDeviceTimezone() ? { 'X-Timezone': getDeviceTimezone() } : {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -186,7 +209,7 @@ const authedRequest = async (endpoint, options = {}) => {
 // ---------------------------------------------------------------------------
 // Offline fallback (used only when the server can't be reached)
 // ---------------------------------------------------------------------------
-const DEFAULT_GOALS = { calorieGoal: 2200, macroGoals: { protein: 140, carbs: 250, fat: 65 } };
+const DEFAULT_GOALS = { calorieGoal: 2200, macroGoals: { protein: 140, carbs: 250, fat: 65 }, waterGoal: 8 };
 let localGoals = { ...DEFAULT_GOALS };
 let localMeals = [];
 let localWater = 0;
@@ -196,6 +219,7 @@ function rememberGoals(user) {
   localGoals = {
     calorieGoal: user.dailyCalorieGoal || DEFAULT_GOALS.calorieGoal,
     macroGoals: user.macroGoals || DEFAULT_GOALS.macroGoals,
+    waterGoal: user.waterGoalGlasses || DEFAULT_GOALS.waterGoal,
   };
 }
 
@@ -235,6 +259,8 @@ const buildLocalDietResponse = () => {
       macroGoals: localGoals.macroGoals,
     },
     waterGlassesToday: localWater,
+    waterGoalGlasses: localGoals.waterGoal,
+    streak: null, // unknown while offline
   };
 };
 
@@ -392,6 +418,35 @@ export const api = {
       localWater = Math.max(0, localWater + (Number(delta) || 1));
     }
     return localWater;
+  },
+
+  // Last `days` days (oldest first): [{ date, calories, meals, waterGlasses }], or null if offline
+  getHistory: async (days = 7) => {
+    const res = await authedRequest(`/diet/history?days=${days}`);
+    return res.ok && res.data?.days ? res.data : null;
+  },
+
+  /**
+   * Uploads a profile photo (base64 JPEG/PNG/WebP, max 300 KB). Resolves the updated user.
+   * Throws Error with a readable message.
+   */
+  uploadAvatar: async (base64) => {
+    const res = await authedRequest('/user/avatar', {
+      method: 'PUT',
+      body: { image: base64 },
+      timeoutMs: 30000,
+    });
+    if (res.ok && res.data?.user) {
+      setCachedUser(res.data.user);
+      return res.data.user;
+    }
+    throw new Error(errorMessage(res, 'Could not upload photo.'));
+  },
+
+  deleteAvatar: async () => {
+    const res = await authedRequest('/user/avatar', { method: 'DELETE' });
+    if (res.ok && res.data?.user) return res.data.user;
+    throw new Error(errorMessage(res, 'Could not remove photo.'));
   },
 
   /**

@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import api, { authApi, setSessionExpiredHandler } from '../services/api';
+import { cancelAllReminders } from '../services/reminders';
 
 const AuthContext = createContext({
   user: null,
@@ -32,6 +33,7 @@ export const AuthProvider = ({ children }) => {
 
     // If the server rejects the session at any point, drop back to the login screen
     setSessionExpiredHandler(() => {
+      cancelAllReminders();
       applyUser(null);
       setIsOffline(false);
     });
@@ -77,6 +79,8 @@ export const AuthProvider = ({ children }) => {
 
   const logout = useCallback(async () => {
     try {
+      // Reminders belong to this account; don't keep notifying after sign out
+      await cancelAllReminders();
       await authApi.logout();
     } finally {
       applyUser(null);
@@ -86,6 +90,7 @@ export const AuthProvider = ({ children }) => {
 
   const logoutAllDevices = useCallback(async () => {
     await authApi.logoutAllDevices(); // throws if the server couldn't be reached
+    await cancelAllReminders();
     applyUser(null);
     setIsOffline(false);
   }, [applyUser]);
@@ -127,6 +132,32 @@ export const AuthProvider = ({ children }) => {
     [applyUser]
   );
 
+  // Merge server-computed values (e.g. streak from /diet/today) without a network call
+  const patchUser = useCallback(
+    (partial) => {
+      if (!userRef.current || !partial) return;
+      const changed = Object.keys(partial).some((k) => userRef.current[k] !== partial[k]);
+      if (changed) applyUser({ ...userRef.current, ...partial });
+    },
+    [applyUser]
+  );
+
+  // Uploads a resized photo (base64) and stores the server's updated user
+  const uploadAvatar = useCallback(
+    async (base64) => {
+      const updated = await api.uploadAvatar(base64);
+      applyUser(updated);
+      return updated;
+    },
+    [applyUser]
+  );
+
+  const removeAvatar = useCallback(async () => {
+    const updated = await api.deleteAvatar();
+    applyUser(updated);
+    return updated;
+  }, [applyUser]);
+
   const contextValue = useMemo(
     () => ({
       user,
@@ -140,8 +171,11 @@ export const AuthProvider = ({ children }) => {
       changePassword,
       updateUser,
       refreshUser,
+      patchUser,
+      uploadAvatar,
+      removeAvatar,
     }),
-    [user, isLoading, isOffline, login, register, logout, logoutAllDevices, changePassword, updateUser, refreshUser]
+    [user, isLoading, isOffline, login, register, logout, logoutAllDevices, changePassword, updateUser, refreshUser, patchUser, uploadAvatar, removeAvatar]
   );
 
   return <AuthContext.Provider value={contextValue}>{children}</AuthContext.Provider>;

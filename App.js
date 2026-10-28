@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { ActivityIndicator, LogBox, Platform, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { NavigationContainer } from '@react-navigation/native';
+import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
+import { addReminderTapListener } from './src/services/reminders';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { Ionicons } from '@expo/vector-icons';
@@ -20,6 +21,8 @@ import GenerateMealScreen from './src/screens/GenerateMealScreen';
 
 const Tab = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
+const navigationRef = createNavigationContainerRef();
+const TAB_SCREENS = ['Home', 'Diet', 'Profile'];
 
 function MainTabs() {
   return (
@@ -88,6 +91,16 @@ function MainTabs() {
 function MainApp() {
   const { isAuthenticated, isLoading } = useAuth();
 
+  // Tapping a reminder opens the related tab (e.g. water reminder -> Diet)
+  useEffect(() => {
+    if (!isAuthenticated) return undefined;
+    return addReminderTapListener((screen) => {
+      if (TAB_SCREENS.includes(screen) && navigationRef.isReady()) {
+        navigationRef.navigate('MainTabs', { screen });
+      }
+    });
+  }, [isAuthenticated]);
+
   // Restoring the saved session from secure storage
   if (isLoading) {
     return (
@@ -113,7 +126,7 @@ function MainApp() {
 
   // If user is authenticated, show full app with Tab Navigator & GenerateMealScreen
   return (
-    <NavigationContainer>
+    <NavigationContainer ref={navigationRef}>
       <StatusBar style="light" />
       <Stack.Navigator screenOptions={{ headerShown: false }}>
         <Stack.Screen name="MainTabs" component={MainTabs} />

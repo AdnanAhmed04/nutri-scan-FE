@@ -71,7 +71,11 @@ export const setCachedUser = (user) => {
     email: user.email,
     dailyCalorieGoal: user.dailyCalorieGoal,
     macroGoals: user.macroGoals,
+    waterGoalGlasses: user.waterGoalGlasses,
     dietType: user.dietType,
+    notifications: user.notifications,
+    avatar: user.avatar,
+    streakDays: user.streakDays,
   };
   return setItem(KEYS.user, JSON.stringify(compact));
 };
