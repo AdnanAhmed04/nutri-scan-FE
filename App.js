@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { StatusBar } from 'expo-status-bar';
-import { LogBox, Platform } from 'react-native';
+import { ActivityIndicator, LogBox, Platform, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -86,11 +86,29 @@ function MainTabs() {
 }
 
 function MainApp() {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, isLoading } = useAuth();
+
+  // Restoring the saved session from secure storage
+  if (isLoading) {
+    return (
+      <View
+        style={{ flex: 1, backgroundColor: '#020617', alignItems: 'center', justifyContent: 'center' }}
+        accessibilityLabel="Loading your account"
+      >
+        <StatusBar style="light" />
+        <ActivityIndicator size="large" color="#10b981" />
+      </View>
+    );
+  }
 
   // If user is logged out, show LoginScreen
   if (!isAuthenticated) {
-    return <LoginScreen />;
+    return (
+      <>
+        <StatusBar style="light" />
+        <LoginScreen />
+      </>
+    );
   }
 
   // If user is authenticated, show full app with Tab Navigator & GenerateMealScreen

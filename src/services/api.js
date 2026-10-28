@@ -1,13 +1,24 @@
 import { Platform } from 'react-native';
 import Constants from 'expo-constants';
+import {
+  getRefreshToken,
+  setRefreshToken,
+  setCachedUser,
+  getCachedUser,
+  clearSession,
+} from './tokenStorage';
 
 const getDefaultBaseUrl = () => {
-  // If running on web
+  // Explicit override, e.g. EXPO_PUBLIC_API_URL=https://api.example.com/api
+  if (process.env.EXPO_PUBLIC_API_URL) {
+    return process.env.EXPO_PUBLIC_API_URL;
+  }
+
   if (Platform.OS === 'web') {
     return 'http://localhost:5000/api';
   }
 
-  // 1. Try to get IP from Expo's Metro bundler connection host
+  // Use the IP of the machine running Metro (works with Expo Go on the same Wi-Fi)
   const hostUri =
     Constants.expoConfig?.hostUri ||
     Constants.manifest2?.extra?.expoClient?.hostUri ||
@@ -20,106 +31,179 @@ const getDefaultBaseUrl = () => {
     }
   }
 
-  // 2. Direct local machine Wi-Fi IP address
+  // Fallback: local machine Wi-Fi IP address
   return 'http://192.168.100.30:5000/api';
 };
 
 export const API_BASE_URL = getDefaultBaseUrl();
 
-// Safe native fetch wrapper with timeout
-const safeFetch = async (endpoint, options = {}, timeoutMs = 4000) => {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+const NETWORK_ERROR_MESSAGE =
+  "Can't reach the server. Check your internet connection and make sure the server is running.";
 
-    const url = `${API_BASE_URL}${endpoint}`;
-    const res = await fetch(url, {
-      ...options,
+// ---------------------------------------------------------------------------
+// Low-level request. Never throws; returns { ok, status, data, networkError }.
+// ---------------------------------------------------------------------------
+const rawRequest = async (endpoint, { method = 'GET', body, token, timeoutMs = 8000 } = {}) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(`${API_BASE_URL}${endpoint}`, {
+      method,
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
-        ...(options.headers || {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
     });
 
-    clearTimeout(timeoutId);
-
-    if (!res.ok) {
-      return null;
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {
+      data = null;
     }
-
-    return await res.json();
+    return { ok: res.ok, status: res.status, data, networkError: false };
   } catch {
-    // Return null silently on network error/timeout so the app falls back smoothly
-    return null;
+    return { ok: false, status: 0, data: null, networkError: true };
+  } finally {
+    clearTimeout(timeoutId);
   }
 };
 
-// In-memory initial fallback state
-const mockProfile = {
-  _id: 'local_1',
-  name: 'Alex Johnson',
-  email: 'alex.johnson@snaptutor.com',
-  avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400&auto=format&fit=crop&q=80',
-  age: 24,
-  gender: 'Male',
-  weightKg: 72,
-  heightCm: 178,
-  dailyCalorieGoal: 2200,
-  macroGoals: { protein: 140, carbs: 250, fat: 65 },
-  waterGoalGlasses: 8,
-  waterGlassesToday: 5,
-  dietType: 'Balanced',
-  activityLevel: 'Moderate',
-  streakDays: 7,
-  allergies: ['Peanuts', 'Lactose'],
-  likedFoods: ['Grilled Salmon', 'Avocado', 'Greek Yogurt', 'Berries'],
-  notifications: {
-    nextMeal: true,
-    hydration: true,
-    dailySummary: true,
-    streakReminder: true,
-  },
+const errorMessage = (res, fallback = 'Something went wrong, please try again.') => {
+  if (res.networkError) return NETWORK_ERROR_MESSAGE;
+  return res.data?.message || fallback;
 };
 
-let localMeals = [
-  {
-    _id: 'm1',
-    name: 'Avocado Toast & Boiled Eggs',
-    mealType: 'breakfast',
-    calories: 420,
-    protein: 18,
-    carbs: 35,
-    fat: 22,
-    portion: '2 slices & 2 eggs',
-    time: '08:15 AM',
-  },
-  {
-    _id: 'm2',
-    name: 'Grilled Chicken & Quinoa Salad',
-    mealType: 'lunch',
-    calories: 580,
-    protein: 48,
-    carbs: 45,
-    fat: 16,
-    portion: '1 bowl (350g)',
-    time: '01:00 PM',
-  },
-  {
-    _id: 'm3',
-    name: 'Greek Yogurt with Blueberries',
-    mealType: 'snack',
-    calories: 190,
-    protein: 15,
-    carbs: 22,
-    fat: 4,
-    portion: '200g',
-    time: '04:30 PM',
-  },
-];
+// ---------------------------------------------------------------------------
+// Session handling: access token in memory, refresh token in secure storage
+// ---------------------------------------------------------------------------
+let accessToken = null;
+let accessTokenExpiresAt = 0;
+let refreshInFlight = null;
+let sessionExpiredHandler = null;
 
-let localWater = 5;
+// AuthContext registers this so the UI returns to the login screen when the session dies
+export const setSessionExpiredHandler = (handler) => {
+  sessionExpiredHandler = handler;
+};
+
+const notifySessionExpired = () => {
+  if (sessionExpiredHandler) sessionExpiredHandler();
+};
+
+const applySession = async (data) => {
+  accessToken = data.accessToken;
+  // Refresh 30s early to avoid using a token that expires mid-request
+  accessTokenExpiresAt = Date.now() + ((data.expiresIn || 900) - 30) * 1000;
+  rememberGoals(data.user);
+  await Promise.all([setRefreshToken(data.refreshToken), setCachedUser(data.user)]);
+};
+
+const endSession = async () => {
+  accessToken = null;
+  accessTokenExpiresAt = 0;
+  resetLocalData();
+  await clearSession();
+};
+
+/**
+ * Exchanges the stored refresh token for a new token pair.
+ * Only one refresh runs at a time; concurrent callers share the same promise
+ * (the server treats re-use of a rotated refresh token as theft).
+ * Resolves { ok: true, user } or { ok: false, reason: 'invalid' | 'network' }.
+ */
+const refreshSession = () => {
+  if (!refreshInFlight) {
+    refreshInFlight = (async () => {
+      const storedToken = await getRefreshToken();
+      if (!storedToken) return { ok: false, reason: 'invalid' };
+
+      const res = await rawRequest('/auth/refresh', {
+        method: 'POST',
+        body: { refreshToken: storedToken },
+      });
+
+      if (res.ok && res.data?.accessToken) {
+        await applySession(res.data);
+        return { ok: true, user: res.data.user };
+      }
+
+      // Server unreachable / overloaded: keep the stored session and try again later
+      if (res.networkError || res.status >= 500 || res.status === 429) {
+        return { ok: false, reason: 'network' };
+      }
+
+      await endSession();
+      return { ok: false, reason: 'invalid' };
+    })().finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
+};
+
+/**
+ * Authenticated request: attaches the access token, refreshes it when expired,
+ * and retries once on 401. Signs the user out if the session can't be renewed.
+ */
+const authedRequest = async (endpoint, options = {}) => {
+  if (!accessToken || Date.now() >= accessTokenExpiresAt) {
+    const refreshed = await refreshSession();
+    if (!refreshed.ok) {
+      if (refreshed.reason === 'invalid') notifySessionExpired();
+      return {
+        ok: false,
+        status: refreshed.reason === 'invalid' ? 401 : 0,
+        data: null,
+        networkError: refreshed.reason === 'network',
+      };
+    }
+  }
+
+  let res = await rawRequest(endpoint, { ...options, token: accessToken });
+
+  if (res.status === 401) {
+    const refreshed = await refreshSession();
+    if (refreshed.ok) {
+      res = await rawRequest(endpoint, { ...options, token: accessToken });
+    } else if (refreshed.reason === 'network') {
+      return { ok: false, status: 0, data: null, networkError: true };
+    }
+
+    if (res.status === 401) {
+      await endSession();
+      notifySessionExpired();
+    }
+  }
+
+  return res;
+};
+
+// ---------------------------------------------------------------------------
+// Offline fallback (used only when the server can't be reached)
+// ---------------------------------------------------------------------------
+const DEFAULT_GOALS = { calorieGoal: 2200, macroGoals: { protein: 140, carbs: 250, fat: 65 } };
+let localGoals = { ...DEFAULT_GOALS };
+let localMeals = [];
+let localWater = 0;
+
+function rememberGoals(user) {
+  if (!user) return;
+  localGoals = {
+    calorieGoal: user.dailyCalorieGoal || DEFAULT_GOALS.calorieGoal,
+    macroGoals: user.macroGoals || DEFAULT_GOALS.macroGoals,
+  };
+}
+
+function resetLocalData() {
+  localGoals = { ...DEFAULT_GOALS };
+  localMeals = [];
+  localWater = 0;
+}
 
 const buildLocalDietResponse = () => {
   const totals = localMeals.reduce(
@@ -135,11 +219,7 @@ const buildLocalDietResponse = () => {
   const groupedMeals = { breakfast: [], lunch: [], dinner: [], snack: [] };
   localMeals.forEach((m) => {
     const key = (m.mealType || 'snack').toLowerCase();
-    if (groupedMeals[key]) {
-      groupedMeals[key].push(m);
-    } else {
-      groupedMeals.snack.push(m);
-    }
+    (groupedMeals[key] || groupedMeals.snack).push(m);
   });
 
   return {
@@ -150,57 +230,143 @@ const buildLocalDietResponse = () => {
     groupedMeals,
     totals,
     goals: {
-      calorieGoal: 2200,
-      remainingCalories: Math.max(0, 2200 - totals.calories),
-      macroGoals: { protein: 140, carbs: 250, fat: 65 },
+      calorieGoal: localGoals.calorieGoal,
+      remainingCalories: Math.max(0, localGoals.calorieGoal - totals.calories),
+      macroGoals: localGoals.macroGoals,
     },
     waterGlassesToday: localWater,
   };
 };
 
+// ---------------------------------------------------------------------------
+// Auth API (throws Error with a user-friendly message on failure)
+// ---------------------------------------------------------------------------
+export const authApi = {
+  login: async (email, password) => {
+    const res = await rawRequest('/auth/login', { method: 'POST', body: { email, password } });
+    if (!res.ok || !res.data?.accessToken) {
+      throw new Error(errorMessage(res, 'Could not sign in.'));
+    }
+    resetLocalData();
+    await applySession(res.data);
+    return res.data.user;
+  },
+
+  register: async (name, email, password) => {
+    const res = await rawRequest('/auth/register', {
+      method: 'POST',
+      body: { name, email, password },
+    });
+    if (!res.ok || !res.data?.accessToken) {
+      throw new Error(errorMessage(res, 'Could not create account.'));
+    }
+    resetLocalData();
+    await applySession(res.data);
+    return res.data.user;
+  },
+
+  /**
+   * Called on app start. Resolves { user, offline } or { user: null } if not signed in.
+   * When the server is unreachable the cached user is returned so the app still opens.
+   */
+  restoreSession: async () => {
+    const storedToken = await getRefreshToken();
+    if (!storedToken) return { user: null };
+
+    const refreshed = await refreshSession();
+    if (refreshed.ok) return { user: refreshed.user, offline: false };
+
+    if (refreshed.reason === 'network') {
+      const cached = await getCachedUser();
+      if (cached) {
+        rememberGoals(cached);
+        return { user: cached, offline: true };
+      }
+    }
+    return { user: null };
+  },
+
+  // Revokes the refresh token on the server (best effort) and wipes local session data
+  logout: async () => {
+    const storedToken = await getRefreshToken();
+    if (storedToken) {
+      await rawRequest('/auth/logout', {
+        method: 'POST',
+        body: { refreshToken: storedToken },
+        timeoutMs: 4000,
+      });
+    }
+    await endSession();
+  },
+
+  logoutAllDevices: async () => {
+    const res = await authedRequest('/auth/logout-all', { method: 'POST' });
+    if (!res.ok) throw new Error(errorMessage(res, 'Could not sign out other devices.'));
+    await endSession();
+  },
+
+  changePassword: async (currentPassword, newPassword) => {
+    const res = await authedRequest('/auth/change-password', {
+      method: 'POST',
+      body: { currentPassword, newPassword },
+    });
+    if (!res.ok || !res.data?.accessToken) {
+      throw new Error(errorMessage(res, 'Could not change password.'));
+    }
+    await applySession(res.data);
+    return res.data.user;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Data API
+// ---------------------------------------------------------------------------
 export const api = {
   checkHealth: async () => {
-    const data = await safeFetch('/health');
-    return data || { status: 'offline', database: { status: 'local fallback' } };
+    const res = await rawRequest('/health');
+    return res.ok ? res.data : { status: 'offline', database: { status: 'unreachable' } };
   },
 
+  // Returns the profile, or null if it couldn't be loaded
   getUserProfile: async () => {
-    const data = await safeFetch('/user/profile');
-    if (data && data.user) {
-      return data.user;
+    const res = await authedRequest('/user/profile');
+    if (res.ok && res.data?.user) {
+      rememberGoals(res.data.user);
+      setCachedUser(res.data.user);
+      return res.data.user;
     }
-    return mockProfile;
+    return null;
   },
 
+  // Returns the saved profile, or null if the server couldn't be reached
   updateUserProfile: async (updates) => {
-    const data = await safeFetch('/user/profile', {
-      method: 'PUT',
-      body: JSON.stringify(updates),
-    });
-    if (data && data.user) {
-      return data.user;
+    const res = await authedRequest('/user/profile', { method: 'PUT', body: updates });
+    if (res.ok && res.data?.user) {
+      rememberGoals(res.data.user);
+      setCachedUser(res.data.user);
+      return res.data.user;
     }
-    return { ...mockProfile, ...updates };
+    if (!res.networkError && res.status === 400) {
+      throw new Error(errorMessage(res));
+    }
+    return null;
   },
 
   getTodayDiet: async () => {
-    const data = await safeFetch('/diet/today');
-    if (data && data.success) {
-      return data;
-    }
+    const res = await authedRequest('/diet/today');
+    if (res.ok && res.data?.success) return res.data;
     return buildLocalDietResponse();
   },
 
   addMeal: async (mealData) => {
-    const data = await safeFetch('/diet/meals', {
-      method: 'POST',
-      body: JSON.stringify(mealData),
-    });
+    const res = await authedRequest('/diet/meals', { method: 'POST', body: mealData });
+    if (res.ok && res.data?.meal) return res.data.meal;
 
-    if (data && data.meal) {
-      return data.meal;
+    if (!res.networkError) {
+      throw new Error(errorMessage(res, 'Could not save meal.'));
     }
 
+    // Offline: keep it locally for this session
     const localMeal = {
       _id: 'local_' + Date.now(),
       ...mealData,
@@ -211,35 +377,43 @@ export const api = {
   },
 
   deleteMeal: async (id) => {
-    await safeFetch(`/diet/meals/${id}`, { method: 'DELETE' });
+    await authedRequest(`/diet/meals/${encodeURIComponent(id)}`, { method: 'DELETE' });
     localMeals = localMeals.filter((m) => String(m._id) !== String(id));
     return true;
   },
 
   updateWater: async (delta) => {
-    const data = await safeFetch('/diet/water', {
-      method: 'POST',
-      body: JSON.stringify({ delta }),
-    });
-
-    if (data && data.waterGlassesToday !== undefined) {
-      return data.waterGlassesToday;
+    const res = await authedRequest('/diet/water', { method: 'POST', body: { delta } });
+    if (res.ok && res.data?.waterGlassesToday !== undefined) {
+      localWater = res.data.waterGlassesToday;
+      return localWater;
     }
-
-    localWater = Math.max(0, localWater + (Number(delta) || 1));
+    if (res.networkError) {
+      localWater = Math.max(0, localWater + (Number(delta) || 1));
+    }
     return localWater;
   },
 
-  sendChatMessage: async (message) => {
-    const data = await safeFetch('/chat/message', {
+  /**
+   * Generates a personalized meal on the server (AI or recipe library).
+   * Resolves { meal, source, context }; throws Error with a readable message.
+   * Error has `.code` (e.g. 'NO_MATCH', 'RATE_LIMITED') when the server sent one.
+   */
+  generateMeal: async ({ mealType, dietType, excludeIds = [], excludeNames = [] }) => {
+    const res = await authedRequest('/diet/generate', {
       method: 'POST',
-      body: JSON.stringify({ message }),
+      body: { mealType, dietType, excludeIds, excludeNames },
+      timeoutMs: 30000, // AI generation can take a while
     });
+    if (res.ok && res.data?.meal) return res.data;
+    const error = new Error(errorMessage(res, 'Could not generate a meal right now.'));
+    error.code = res.networkError ? 'NETWORK' : res.data?.code;
+    throw error;
+  },
 
-    if (data && data.reply) {
-      return data;
-    }
-
+  sendChatMessage: async (message) => {
+    const res = await authedRequest('/chat/message', { method: 'POST', body: { message } });
+    if (res.ok && res.data?.reply) return res.data;
     return {
       reply: `I received your question: "${message}". Snap Tutor AI will assist you soon!`,
     };
