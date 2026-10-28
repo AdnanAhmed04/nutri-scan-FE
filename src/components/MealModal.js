@@ -57,6 +57,7 @@ export default function MealModal({ visible, onClose, onAddMeal, initialMealType
       onClose();
     } catch (e) {
       console.log('Error saving meal:', e.message);
+      alert(e.message || 'Could not save meal. Please try again.');
     } finally {
       setIsSubmitting(false);
     }

@@ -15,6 +15,8 @@ import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import tw from '../theme/tailwind';
 import Header from '../components/Header';
+import ChangePasswordModal from '../components/ChangePasswordModal';
+import { confirmAction, showMessage } from '../utils/dialogs';
 import { useAuth } from '../context/AuthContext';
 
 const DIET_TYPES = ['Balanced', 'High Protein', 'Keto', 'Vegan', 'Vegetarian', 'Low Carb'];
@@ -41,9 +43,50 @@ const DEFAULT_LIKED_FOODS = [
 ];
 
 export default function ProfileScreen({ navigation, route }) {
-  const { user, updateUser, logout, refreshUser } = useAuth();
+  const { user, updateUser, logout, logoutAllDevices, refreshUser } = useAuth();
   const scrollViewRef = useRef(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [passwordModalVisible, setPasswordModalVisible] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+
+  // Revokes this device's session on the server and clears stored tokens.
+  // AuthContext then clears the user and App shows the login screen.
+  const handleSignOut = async () => {
+    if (signingOut) return;
+    const confirmed = await confirmAction({
+      title: 'Sign Out',
+      message: 'Are you sure you want to sign out?',
+      confirmText: 'Sign Out',
+      destructive: true,
+    });
+    if (!confirmed) return;
+    setSigningOut(true);
+    try {
+      await logout();
+    } catch (e) {
+      // logout always clears the local session, even if the server call fails
+      console.log('Sign out error:', e.message);
+      setSigningOut(false);
+    }
+  };
+
+  const handleSignOutAll = async () => {
+    if (signingOut) return;
+    const confirmed = await confirmAction({
+      title: 'Sign Out Everywhere',
+      message: 'This signs you out on all devices, including this one.',
+      confirmText: 'Sign Out All',
+      destructive: true,
+    });
+    if (!confirmed) return;
+    setSigningOut(true);
+    try {
+      await logoutAllDevices();
+    } catch (e) {
+      setSigningOut(false);
+      showMessage('Error', e.message || 'Could not sign out other devices.');
+    }
+  };
 
   // Profile Basic State
   const [avatar, setAvatar] = useState(
@@ -450,7 +493,7 @@ export default function ProfileScreen({ navigation, route }) {
 
           <Text style={tw`text-white text-xl font-bold`}>{user?.name || name}</Text>
           <Text style={tw`text-slate-400 text-xs mt-0.5`}>
-            {user?.email || 'alex.johnson@snaptutor.com'}
+            {user?.email || ''}
           </Text>
 
           <View style={tw`flex-row items-center gap-2 mt-3`}>
@@ -1281,33 +1324,69 @@ export default function ProfileScreen({ navigation, route }) {
           )}
         </View>
 
-        {/* Account & Security (Logout) */}
+        {/* Account & Security */}
         <View style={tw`bg-slate-900 border border-slate-800 rounded-3xl p-5 mb-5 shadow-lg`}>
-          <Text style={tw`text-white font-bold text-sm mb-3`}>Account Actions</Text>
+          <Text style={tw`text-white font-bold text-sm mb-3`}>Account & Security</Text>
 
           <TouchableOpacity
-            onPress={() => {
-              Alert.alert('Sign Out', 'Are you sure you want to log out of Nutri-Scan?', [
-                { text: 'Cancel', style: 'cancel' },
-                {
-                  text: 'Sign Out',
-                  style: 'destructive',
-                  onPress: () => logout(),
-                },
-              ]);
-            }}
+            onPress={() => setPasswordModalVisible(true)}
+            accessibilityRole="button"
+            style={tw`flex-row items-center justify-between py-2`}
+          >
+            <View style={tw`flex-row items-center`}>
+              <View style={tw`w-8 h-8 rounded-lg bg-emerald-500/20 items-center justify-center mr-2.5`}>
+                <Ionicons name="key-outline" size={17} color="#10b981" />
+              </View>
+              <Text style={tw`text-slate-200 text-sm font-semibold`}>Change Password</Text>
+            </View>
+            <Ionicons name="chevron-forward" size={16} color="#64748b" />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={handleSignOutAll}
+            disabled={signingOut}
+            accessibilityRole="button"
+            accessibilityState={{ disabled: signingOut }}
+            style={tw`flex-row items-center justify-between py-2 ${signingOut ? 'opacity-50' : ''}`}
+          >
+            <View style={tw`flex-row items-center`}>
+              <View style={tw`w-8 h-8 rounded-lg bg-amber-500/20 items-center justify-center mr-2.5`}>
+                <Ionicons name="phone-portrait-outline" size={17} color="#f59e0b" />
+              </View>
+              <Text style={tw`text-slate-200 text-sm font-semibold`}>Sign Out All Devices</Text>
+            </View>
+            <Ionicons name="chevron-forward" size={16} color="#64748b" />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={handleSignOut}
+            disabled={signingOut}
+            accessibilityRole="button"
+            accessibilityLabel="Sign out"
+            accessibilityState={{ disabled: signingOut, busy: signingOut }}
             style={tw`flex-row items-center justify-between py-2`}
           >
             <View style={tw`flex-row items-center`}>
               <View style={tw`w-8 h-8 rounded-lg bg-rose-500/20 items-center justify-center mr-2.5`}>
                 <Ionicons name="log-out-outline" size={17} color="#f43f5e" />
               </View>
-              <Text style={tw`text-rose-400 text-sm font-semibold`}>Sign Out</Text>
+              <Text style={tw`text-rose-400 text-sm font-semibold`}>
+                {signingOut ? 'Signing out...' : 'Sign Out'}
+              </Text>
             </View>
-            <Ionicons name="chevron-forward" size={16} color="#64748b" />
+            {signingOut ? (
+              <ActivityIndicator size="small" color="#f43f5e" />
+            ) : (
+              <Ionicons name="chevron-forward" size={16} color="#64748b" />
+            )}
           </TouchableOpacity>
         </View>
       </ScrollView>
+
+      <ChangePasswordModal
+        visible={passwordModalVisible}
+        onClose={() => setPasswordModalVisible(false)}
+      />
     </View>
   );
 }
